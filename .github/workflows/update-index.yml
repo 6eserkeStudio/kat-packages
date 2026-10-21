@@ -1,0 +1,107 @@
+name: Update R2 Index on Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-index:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS CLI for R2
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          aws configure set region auto
+
+      - name: Download current index
+        run: |
+          aws s3 cp s3://${{ secrets.R2_BUCKET }}/index-official.json index-official.json \
+            --endpoint-url ${{ secrets.R2_ENDPOINT }} || echo '[]' > index-official.json
+
+      - name: Download and process release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get the .kat file from the release
+          TAG=${{ github.event.release.tag_name }}
+          REPO=${{ github.repository }}
+          
+          # List assets and find .kat file
+          ASSET=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' | grep '\.kat$' | head -1)
+          
+          if [ -z "$ASSET" ]; then
+            echo "No .kat file found in release"
+            exit 1
+          fi
+          
+          echo "Found: $ASSET"
+          
+          # Download the .kat file
+          gh release download "$TAG" --repo "$REPO" --pattern "*.kat" --dir .
+          
+          # Calculate SHA-256 and size
+          SHA256=$(sha256sum "$ASSET" | cut -d' ' -f1)
+          SIZE=$(stat -c%s "$ASSET")
+          
+          echo "SHA-256: $SHA256"
+          echo "Size: $SIZE"
+          
+          # Extract metadata.json from the .kat file
+          mkdir -p /tmp/extract
+          tar xzf "$ASSET" -C /tmp/extract metadata.json 2>/dev/null || tar xf "$ASSET" -C /tmp/extract metadata.json 2>/dev/null
+          
+          if [ ! -f /tmp/extract/metadata.json ]; then
+            echo "No metadata.json found in package, using tag info"
+            PKG_NAME=$(echo "$TAG" | sed 's/-[0-9].*//')
+            PKG_VERSION=$(echo "$TAG" | sed "s/${PKG_NAME}-//")
+            PKG_DESC="Official package"
+            PKG_ARCH="x86_64"
+            PKG_DEPS="[]"
+          else
+            PKG_NAME=$(python3 -c "import json; print(json.load(open('/tmp/extract/metadata.json'))['name'])" 2>/dev/null || echo "$TAG" | sed 's/-[0-9].*//')
+            PKG_VERSION=$(python3 -c "import json; print(json.load(open('/tmp/extract/metadata.json'))['version'])" 2>/dev/null || echo "$TAG" | sed "s/${PKG_NAME}-//")
+            PKG_DESC=$(python3 -c "import json; print(json.load(open('/tmp/extract/metadata.json')).get('description','Official package'))" 2>/dev/null || echo "Official package")
+            PKG_ARCH=$(python3 -c "import json; print(json.load(open('/tmp/extract/metadata.json')).get('arch','x86_64'))" 2>/dev/null || echo "x86_64")
+            PKG_DEPS=$(python3 -c "import json; print(json.dumps(json.load(open('/tmp/extract/metadata.json')).get('dependencies',[])))" 2>/dev/null || echo "[]")
+          fi
+          
+          DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
+          
+          echo "Package: $PKG_NAME v$PKG_VERSION"
+          
+          # Update index-official.json
+          python3 << EOF
+          import json
+          
+          with open('index-official.json', 'r') as f:
+              index = json.load(f)
+          
+          # Remove old entry if exists
+          index = [p for p in index if p.get('name') != '$PKG_NAME']
+          
+          # Add new entry
+          entry = {
+              "name": "$PKG_NAME",
+              "version": "$PKG_VERSION",
+              "description": "$PKG_DESC",
+              "dependencies": $PKG_DEPS,
+              "size": "$SIZE",
+              "download_url": "$DOWNLOAD_URL",
+              "sha256": "$SHA256",
+              "arch": "$PKG_ARCH",
+              "repo": "official"
+          }
+          index.append(entry)
+          
+          with open('index-official.json', 'w') as f:
+              json.dump(index, f, indent=2)
+          EOF
+          
+          echo "Index updated with $PKG_NAME"
+
+      - name: Upload updated index to R2
+        run: |
+          aws s3 cp index-official.json s3://${{ secrets.R2_BUCKET }}/index-official.json \
+            --endpoint-url ${{ secrets.R2_ENDPOINT }}
+          echo "Index uploaded to R2"
